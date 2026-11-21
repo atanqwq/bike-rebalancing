@@ -1,0 +1,5 @@
+algo,cost_mean,cost_std,travel_mean,unmet_mean,time_mean
+ga,133.0,1.414,103.0,15.0,0.016
+greedy,136.0,,104.0,16.0,0.001
+sa,136.0,0.0,104.0,16.0,0.017
+tabu,125.0,1.414,102.0,11.5,0.012

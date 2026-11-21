@@ -1,0 +1,2 @@
+n_stations,pairs,mean_expansions,max_expansions,mean_cost_astar,mean_cost_euclid,detour_ratio
+40,780,20.56282051282051,94,7.72948717948718,5.979058772830812,1.2810082046654705

@@ -1,0 +1,14 @@
+{
+  "seeds": [
+    0
+  ],
+  "stations": 40,
+  "days": 60,
+  "budget": 600,
+  "fast": true,
+  "best_model": "rf",
+  "best_r2": 0.8548,
+  "elapsed_s": 147.0,
+  "n_jobs": 1,
+  "note": "N_JOBS=1 时 train_time 偏慢；本机可改 config.N_JOBS=-1"
+}

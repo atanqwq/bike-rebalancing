@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# 可再生的中间产物（体积大，不入库）
+data/clean.csv
+data/predictions.csv
+data/cost_matrix.npy
+data/grid_meta.npz
+run_log.txt
+*.log
+
+# 注意：results/ figures/ tables/ 必须入库。
+# 论文里的每个数字都要能追到 results/*.csv，图要能追到 figures/*.pdf。
