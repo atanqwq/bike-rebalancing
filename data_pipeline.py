@@ -223,7 +223,7 @@ def station_profiles(df: pd.DataFrame) -> np.ndarray:
     return prof.to_numpy()
 
 
-def cluster_stations(profiles: np.ndarray, k_range=range(2, 9), seed: int = 0):
+def cluster_stations(profiles: np.ndarray, k_range=range(2, 11), seed: int = 0):
     """K-means + 肘部法（SSE）+ 轮廓系数，返回最优 k 与标签。"""
     from sklearn.cluster import KMeans
     from sklearn.metrics import silhouette_score
