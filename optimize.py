@@ -283,6 +283,7 @@ def ga(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True,
     """遗传算法。种群用**最近邻解暖启动**（1 个精英）+ 随机个体，保证不劣于基线。
 
     trace_x: 传入列表时，按代记录「到该代为止真实调用 evaluate 的次数」，给 E5 画横轴。
+    硬上限：每一次 ctx.evaluate 都计入次数，用尽 budget 立刻停；循环外不再 evaluate。
     """
     rng = np.random.default_rng(seed)
     n0 = ctx.n_eval                                  # ctx 会被复用，预算按本次运行单独计
@@ -293,38 +294,66 @@ def ga(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True,
         if rng.random() < 0.5:                      # 一半个体是最近邻解的扰动
             p = _mutate(list(seed_perm), np.random.default_rng(rng.integers(1 << 30)), 1.0)
         pop.append(p)
-    scored = sorted(((ctx.evaluate(p)["cost"], p) for p in pop), key=lambda t: t[0])
-    best_cost, best_perm = scored[0][0], scored[0][1]
+    # 初始种群逐个打分，并保存完整最优解（循环结束直接返回，不再 evaluate）
+    scored = []
+    for p in pop:
+        sol = ctx.evaluate(p)
+        scored.append((sol["cost"], p, sol))
+    scored.sort(key=lambda t: t[0])
+    best_cost, best_perm, best_sol = scored[0][0], scored[0][1], scored[0][2]
     hist = [best_cost]
     if trace_x is not None:
         trace_x.append(ctx.n_eval - n0)
 
     while ctx.n_eval - n0 < budget:
-        # 锦标赛选择
+        # 锦标赛选择：候选人逐个 evaluate，次数用完立刻停
         new_pop = [list(best_perm)]                      # 精英保留
+        n_scored = len(scored)
+
+        def _tournament_pick():
+            cand = rng.integers(0, n_scored, C.GA_TOURNAMENT)
+            win_p, win_c = None, math.inf
+            for i in cand:
+                if ctx.n_eval - n0 >= budget:
+                    break
+                sol = ctx.evaluate(scored[i][1])
+                if sol["cost"] < win_c:
+                    win_c, win_p = sol["cost"], scored[i][1]
+            return win_p
+
         while len(new_pop) < C.GA_POP:
-            cand = rng.integers(0, C.GA_POP, C.GA_TOURNAMENT)
-            p1 = min((scored[i][1] for i in cand), key=lambda p: ctx.evaluate(p)["cost"])
-            cand = rng.integers(0, C.GA_POP, C.GA_TOURNAMENT)
-            p2 = min((scored[i][1] for i in cand), key=lambda p: ctx.evaluate(p)["cost"])
+            if ctx.n_eval - n0 >= budget:
+                break
+            p1 = _tournament_pick()
+            if p1 is None or ctx.n_eval - n0 >= budget:
+                break
+            p2 = _tournament_pick()
+            if p2 is None:
+                break
             c1, c2 = _ox_crossover(p1, p2, rng, C.GA_PX)
             for c in (c1, c2):
                 new_pop.append(_mutate(c, rng, C.GA_PM))
                 if len(new_pop) >= C.GA_POP:
                     break
-            if ctx.n_eval - n0 >= budget:                # 预算用尽，丢弃这一代剩下的子代
-                break
 
-        scored = sorted(((ctx.evaluate(p)["cost"], p) for p in new_pop), key=lambda t: t[0])
+        # 新种群逐个打分，用尽预算立刻停
+        scored = []
+        for p in new_pop:
+            if ctx.n_eval - n0 >= budget:
+                break
+            sol = ctx.evaluate(p)
+            scored.append((sol["cost"], p, sol))
+        if not scored:
+            break
+        scored.sort(key=lambda t: t[0])
         if scored[0][0] < best_cost:
-            best_cost, best_perm = scored[0][0], scored[0][1]
+            best_cost, best_perm, best_sol = scored[0][0], scored[0][1], scored[0][2]
         hist.append(best_cost)
         if trace_x is not None:
             trace_x.append(ctx.n_eval - n0)
 
-    sol = ctx.evaluate(best_perm)
     assert not ctx.check_solution(best_perm), ctx.check_solution(best_perm)   # 非法解兜底
-    return sol, (hist if trace else [best_cost])
+    return best_sol, (hist if trace else [best_cost])
 
 
 # --------------------------------------------------------------------------
@@ -332,11 +361,15 @@ def ga(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True,
 # --------------------------------------------------------------------------
 def sa(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True,
        trace_x=None):
-    """模拟退火：Metropolis 准则 P = exp(-(C(x')-C(x))/T)，C 越小越好。从最近邻解出发。"""
+    """模拟退火：Metropolis 准则 P = exp(-(C(x')-C(x))/T)，C 越小越好。从最近邻解出发。
+
+    循环外不再 evaluate：最优完整结果存在 best_sol，用尽 budget 即停。
+    """
     rng = np.random.default_rng(seed)
     n0 = ctx.n_eval                                  # ctx 会被复用，预算按本次运行单独计
     cur = ctx.greedy_perm()
-    cur_cost = ctx.evaluate(cur)["cost"]
+    best_sol = ctx.evaluate(cur)
+    cur_cost = best_sol["cost"]
     best, best_cost = list(cur), cur_cost
     hist = [cur_cost]
     if trace_x is not None:
@@ -351,19 +384,20 @@ def sa(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True,
         else:
             i, j = rng.choice(ctx.n_items, size=2, replace=False)
             cand.insert(j, cand.pop(i))
-        c_cost = ctx.evaluate(cand)["cost"]
+        c_sol = ctx.evaluate(cand)
+        c_cost = c_sol["cost"]
         d = c_cost - cur_cost
         if d < 0 or rng.random() < math.exp(-d / max(T, 1e-9)):
             cur, cur_cost = cand, c_cost
             if cur_cost < best_cost:
-                best, best_cost = list(cur), cur_cost
+                best, best_cost, best_sol = list(cur), cur_cost, c_sol
         hist.append(best_cost)
         if trace_x is not None:
             trace_x.append(ctx.n_eval - n0)
         T *= C.SA_COOL
 
     assert not ctx.check_solution(best), ctx.check_solution(best)             # 非法解兜底
-    return ctx.evaluate(best), (hist if trace else [best_cost])
+    return best_sol, (hist if trace else [best_cost])
 
 
 # --------------------------------------------------------------------------
@@ -380,7 +414,7 @@ def tabu(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True
     n0 = ctx.n_eval                                  # ctx 会被复用，预算按本次运行单独计
     cur = ctx.greedy_perm()
     cur_sol = ctx.evaluate(cur)
-    best, best_cost = list(cur), cur_sol["cost"]
+    best, best_cost, best_sol = list(cur), cur_sol["cost"], cur_sol
     hist = [best_cost]
     if trace_x is not None:
         trace_x.append(ctx.n_eval - n0)
@@ -408,7 +442,7 @@ def tabu(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True
             break
         cur, cur_sol = list(best_nb["perm"]), best_nb
         if cur_sol["cost"] < best_cost:
-            best, best_cost = list(cur), cur_sol["cost"]
+            best, best_cost, best_sol = list(cur), cur_sol["cost"], cur_sol
             stall = 0                                          # 强化：刚刷新最优解，缩短禁忌让其回来
             tenure_scale = max(tenure_scale * _TABU_INTENSIFY, 0.2)
         else:
@@ -425,7 +459,7 @@ def tabu(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True
             trace_x.append(ctx.n_eval - n0)
 
     assert not ctx.check_solution(best), ctx.check_solution(best)             # 非法解兜底
-    return ctx.evaluate(best), (hist if trace else [best_cost])
+    return best_sol, (hist if trace else [best_cost])
 
 
 ALGOS = {"greedy": greedy, "ga": ga, "sa": sa, "tabu": tabu}
@@ -646,4 +680,12 @@ if __name__ == "__main__":
     bad_perm = ctx.items[:-1] + [ctx.items[0]]
     assert ctx.check_solution(bad_perm), "重复站点的非法排列未被抓到"
     print("[自测] 约束检查 OK")
+
+    # 自测 5：真实评估次数不许超过 budget（GA/SA/Tabu）
+    for name, fn in (("ga", ga), ("sa", sa), ("tabu", tabu)):
+        n0 = ctx.n_eval
+        fn(ctx, budget=600, seed=0, trace=False)
+        used = ctx.n_eval - n0
+        assert used <= 600, f"{name} 用了 {used} 次，超过 budget=600"
+        print(f"[自测] {name} 评估次数 {used} <= 600 OK")
     print("[自测] PASSED")
