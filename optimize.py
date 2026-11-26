@@ -28,8 +28,8 @@ results/E5_compare.csv    algo, seed, run, final_cost, travel, unmet, evals, tim
 results/E5_traces.npz     三个算法每个轨迹点的 best-so-far 成本
 results/E5_traces_x.npz   同上，每个轨迹点对应的**真实评估次数**（给 Fig.4 画横轴）
 results/E7_scale.csv      n_stations, astar_time, opt_time
-results/E6_sensitivity.csv noise_level, final_cost, cost_std, regret_pct, regret_std,
-                           rounds, delta_pct, delta_std, noise_mode
+results/E6_sensitivity.csv        noise_level, final_cost, ..., delta_pct, noise_mode
+results/E6_sensitivity_rounds.csv round, noise_level, cost_true, oracle_cost, delta_pct, noise_mode
 """
 from __future__ import annotations
 
@@ -294,9 +294,11 @@ def ga(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True,
         if rng.random() < 0.5:                      # 一半个体是最近邻解的扰动
             p = _mutate(list(seed_perm), np.random.default_rng(rng.integers(1 << 30)), 1.0)
         pop.append(p)
-    # 初始种群逐个打分，并保存完整最优解（循环结束直接返回，不再 evaluate）
+    # 初始种群逐个打分（遵守预算）；保存完整最优解，循环结束直接返回
     scored = []
     for p in pop:
+        if ctx.n_eval - n0 >= budget:
+            break
         sol = ctx.evaluate(p)
         scored.append((sol["cost"], p, sol))
     scored.sort(key=lambda t: t[0])
@@ -352,6 +354,11 @@ def ga(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True,
         if trace_x is not None:
             trace_x.append(ctx.n_eval - n0)
 
+    # 锦标赛/提前退出后补记真实终点（不新增 evaluate）
+    used = ctx.n_eval - n0
+    if trace_x is not None and (not trace_x or trace_x[-1] != used):
+        hist.append(best_cost)
+        trace_x.append(used)
     assert not ctx.check_solution(best_perm), ctx.check_solution(best_perm)   # 非法解兜底
     return best_sol, (hist if trace else [best_cost])
 
@@ -458,6 +465,11 @@ def tabu(ctx: Ctx, budget: int = C.OPT_BUDGET, seed: int = 0, trace: bool = True
         if trace_x is not None:
             trace_x.append(ctx.n_eval - n0)
 
+    # 提前退出时补记真实终点（不新增 evaluate）
+    used = ctx.n_eval - n0
+    if trace_x is not None and (not trace_x or trace_x[-1] != used):
+        hist.append(best_cost)
+        trace_x.append(used)
     assert not ctx.check_solution(best), ctx.check_solution(best)             # 非法解兜底
     return best_sol, (hist if trace else [best_cost])
 
@@ -477,24 +489,27 @@ def run_e5(ctx: Ctx, seeds=None, runs: int = 5, budget: int = C.OPT_BUDGET, quie
             for r in range(runs if name != "greedy" else 1):
                 t0 = time.time()
                 xs = []                                  # 每个轨迹点对应的真实评估次数
+                n_before = ctx.n_eval
                 if name != "greedy":
                     sol, hist = ALGOS[name](ctx, budget=budget, seed=s + r * 100, trace_x=xs)
+                    used = ctx.n_eval - n_before
                 else:
                     sol, hist = greedy(ctx)
+                    used = 1
                     xs = [1]
                 dt = time.time() - t0
                 rows.append({"algo": name, "seed": s, "run": r,
                              "final_cost": round(sol["cost"], 3),
                              "travel": round(sol["travel"], 3),
                              "unmet": round(sol["unmet"], 2),
-                             "evals": int(xs[-1]) if xs else 1,
+                             "evals": int(used),
                              "time": round(dt, 3)})
                 traces.setdefault(name, []).append(hist)
                 traces_x.setdefault(name, []).append(xs)
                 if not quiet:
                     print(f"[E5] {name:6s} seed={s}.{r}  cost={sol['cost']:.2f}  "
                           f"travel={sol['travel']:.1f}  unmet={sol['unmet']:.0f}  "
-                          f"evals={xs[-1]}  {dt:.2f}s")
+                          f"evals={used}  {dt:.2f}s")
         if name == "greedy" and not quiet:
             print(f"[E5] greedy 仅 1 次（确定性基线）")
     out = pd.DataFrame(rows)
@@ -573,6 +588,8 @@ def run_e6(pred_df: pd.DataFrame, stations: pd.DataFrame, cost: np.ndarray,
     ids = np.sort(pred_df["station_id"].unique())         # 逐站点抽因子的固定顺序
     per_level = {lv: [] for lv in levels}
     regrets = {lv: [] for lv in levels}
+    deltas = {lv: [] for lv in levels}
+    round_rows = []
 
     for r in range(rounds):
         s = seed * 1000 + r                              # 同一轮内所有噪声档共享库存与站点集合
@@ -584,6 +601,7 @@ def run_e6(pred_df: pd.DataFrame, stations: pd.DataFrame, cost: np.ndarray,
         depot_pos = ctx_or.depot                           # 完美预测决定的 depot，四档共用
         td = truth_deficits(pred_df, stations, sel_ids, seed=s)
 
+        cost_by_lv = {}
         for lv in levels:
             # ② 站点级噪声：每站一个乘性因子，同一站点所有小时共用一个误差
             p = pred_df.copy()
@@ -602,21 +620,31 @@ def run_e6(pred_df: pd.DataFrame, stations: pd.DataFrame, cost: np.ndarray,
 
             # ③ 用「真实需求」结算这份计划，所有噪声档共用同一个真实缺口
             cost_true = ctx_plan.with_truth(td).evaluate(sol["perm"])["cost"]
+            cost_by_lv[lv] = cost_true
             per_level[lv].append(cost_true)
             regrets[lv].append((cost_true / oracle_cost - 1) * 100 if oracle_cost else 0.0)
 
-    base = np.asarray(per_level[levels[0]])              # 0% 档就是配对基准
+        base_r = cost_by_lv[levels[0]]                   # 本轮 0% 档真实成本
+        for lv in levels:
+            cost_true = cost_by_lv[lv]
+            delta_r = 0.0 if base_r == 0 else (cost_true - base_r) / base_r * 100
+            deltas[lv].append(delta_r)
+            round_rows.append({"round": r, "noise_level": round(lv, 3),
+                               "cost_true": round(float(cost_true), 3),
+                               "oracle_cost": round(float(oracle_cost), 3),
+                               "delta_pct": round(float(delta_r), 2),
+                               "noise_mode": noise_mode})
+
     rows = []
     for lv in levels:
         arr = np.asarray(per_level[lv])
-        delta = (arr - base) / base * 100                # 配对差：同库存、同站点、同 depot
+        delta = np.asarray(deltas[lv])
         rows.append({"noise_level": round(lv, 3),
                      "final_cost": round(float(arr.mean()), 3),
                      "cost_std": round(float(arr.std()), 3),
                      "regret_pct": round(float(np.mean(regrets[lv])), 2),
                      "regret_std": round(float(np.std(regrets[lv])), 2),
                      "rounds": rounds,
-                     # 新增列放最后，原列顺序不变（下游按列名取值，顺序只影响肉眼）
                      "delta_pct": round(float(delta.mean()), 2),
                      "delta_std": round(float(delta.std()), 2),
                      "noise_mode": noise_mode})
@@ -625,6 +653,7 @@ def run_e6(pred_df: pd.DataFrame, stations: pd.DataFrame, cost: np.ndarray,
               f"正比例 {np.mean(delta > 0):4.0%}  相对完美预测 {np.mean(regrets[lv]):+5.2f}%")
     out = pd.DataFrame(rows)
     out.to_csv(C.RES_DIR / "E6_sensitivity.csv", index=False)
+    pd.DataFrame(round_rows).to_csv(C.RES_DIR / "E6_sensitivity_rounds.csv", index=False)
     return out
 
 
@@ -688,4 +717,23 @@ if __name__ == "__main__":
         used = ctx.n_eval - n0
         assert used <= 600, f"{name} 用了 {used} 次，超过 budget=600"
         print(f"[自测] {name} 评估次数 {used} <= 600 OK")
+
+    # 自测 6：budget=120 时 n_eval 增量与轨迹终点一致
+    for name, fn in (("ga", ga), ("sa", sa), ("tabu", tabu)):
+        xs = []
+        n0 = ctx.n_eval
+        fn(ctx, budget=120, seed=0, trace=True, trace_x=xs)
+        used = ctx.n_eval - n0
+        assert used <= 120, f"{name} budget=120 用了 {used}"
+        assert xs and xs[-1] == used, f"{name} 轨迹终点 {xs[-1] if xs else None} != n_eval {used}"
+        print(f"[自测] {name} budget=120 n_eval={used} 轨迹终点={xs[-1]} OK")
+
+    # 自测 7：budget=20（小于 GA_POP=40）初始化也不超预算
+    n0 = ctx.n_eval
+    xs = []
+    ga(ctx, budget=20, seed=0, trace=True, trace_x=xs)
+    used = ctx.n_eval - n0
+    assert used <= 20, f"GA budget=20 用了 {used}"
+    assert xs and xs[-1] == used, f"GA budget=20 轨迹终点 {xs[-1]} != {used}"
+    print(f"[自测] GA budget=20 n_eval={used} 轨迹终点={xs[-1]} OK")
     print("[自测] PASSED")
